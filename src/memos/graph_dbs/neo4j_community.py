@@ -1038,35 +1038,48 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
             f"[delete_node_by_prams] Deleting nodes - memory_ids: {memory_ids}, file_ids: {file_ids}, filter: {filter}"
         )
 
-        # First count matching nodes to get accurate count
-        count_query = f"MATCH (n:Memory) WHERE {ids_where} RETURN count(n) AS node_count"
-        logger.info(f"[delete_node_by_prams] count_query: {count_query}")
-        print(f"[delete_node_by_prams] count_query: {count_query}")
+        # First fetch the matching node ids so we can (a) report an accurate
+        # deleted count and (b) cascade the delete into the vector store.
+        # Without this, the Neo4j DETACH DELETE leaves orphan points in Qdrant
+        # (Bug 4 from the 2026-04-26 storage audit).
+        select_ids_query = f"MATCH (n:Memory) WHERE {ids_where} RETURN n.id AS id"
+        logger.info(f"[delete_node_by_prams] select_ids_query: {select_ids_query}")
 
         # Then delete nodes
         delete_query = f"MATCH (n:Memory) WHERE {ids_where} DETACH DELETE n"
         logger.info(f"[delete_node_by_prams] delete_query: {delete_query}")
-        print(f"[delete_node_by_prams] delete_query: {delete_query}")
-        print(f"[delete_node_by_prams] params: {params}")
 
         deleted_count = 0
+        node_ids: list[str] = []
         try:
             with self.driver.session(database=self.db_name) as session:
-                # Count nodes before deletion
-                count_result = session.run(count_query, **params)
-                count_record = count_result.single()
-                expected_count = 0
-                if count_record:
-                    expected_count = count_record["node_count"] or 0
+                # Resolve the node ids before deletion
+                id_result = session.run(select_ids_query, **params)
+                node_ids = [record["id"] for record in id_result if record["id"]]
 
                 # Delete nodes
                 session.run(delete_query, **params)
-                # Use the count from before deletion as the actual deleted count
-                deleted_count = expected_count
+                deleted_count = len(node_ids)
 
         except Exception as e:
             logger.error(f"[delete_node_by_prams] Failed to delete nodes: {e}", exc_info=True)
             raise
+
+        # Cascade delete to the vector store. Mirrors delete_node_by_mem_cube_id
+        # at line ~1335. We swallow vec_db errors with a warning rather than
+        # raising, so that a transient Qdrant outage does not roll back a
+        # successful Neo4j deletion (the orphan would be a smaller problem
+        # than a half-failed delete that the caller can't reason about).
+        if node_ids and self.vec_db:
+            try:
+                self.vec_db.delete(node_ids)
+                logger.info(
+                    f"[delete_node_by_prams] Deleted {len(node_ids)} vectors from VecDB"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[delete_node_by_prams] Failed to delete vectors from VecDB: {e}"
+                )
 
         logger.info(f"[delete_node_by_prams] Successfully deleted {deleted_count} nodes")
         return deleted_count
