@@ -4,6 +4,7 @@ import json
 
 from typing import TYPE_CHECKING
 
+from memos.core.redactor import redact
 from memos.log import get_logger
 from memos.mem_scheduler.schemas.task_schemas import (
     ADD_TASK_LABEL,
@@ -53,7 +54,12 @@ class AddMessageHandler(BaseSchedulerHandler):
         try:
             userinput_memory_ids = json.loads(msg.content)
         except Exception as e:
-            logger.error(f"Error: {e}. Content: {msg.content}", exc_info=True)
+            logger.error(
+                "Parse error on content (redacted): %s. Content: %s",
+                redact(str(e)),
+                redact(msg.content if isinstance(msg.content, str) else str(msg.content)),
+                exc_info=True,
+            )
             userinput_memory_ids = []
 
         prepared_add_items = []
@@ -115,11 +121,12 @@ class AddMessageHandler(BaseSchedulerHandler):
                 )
 
         if missing_ids:
-            content_preview = (
+            raw_preview = (
                 msg.content[:200] + "..."
                 if isinstance(msg.content, str) and len(msg.content) > 200
                 else msg.content
             )
+            content_preview = redact(raw_preview)
             logger.warning(
                 "Missing TextualMemoryItem(s) during add log preparation. "
                 "memory_ids=%s user_id=%s mem_cube_id=%s task_id=%s item_id=%s redis_msg_id=%s label=%s stream_key=%s content_preview=%s",

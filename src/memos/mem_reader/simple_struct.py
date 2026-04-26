@@ -13,6 +13,7 @@ from memos import log
 from memos.chunkers import ChunkerFactory
 from memos.configs.mem_reader import SimpleStructMemReaderConfig
 from memos.context.context import ContextThreadPoolExecutor
+from memos.core.redactor import redact, redact_dict
 from memos.embedders.factory import EmbedderFactory
 from memos.llms.factory import LLMFactory
 from memos.mem_reader.base import BaseMemReader
@@ -154,6 +155,9 @@ def _build_node(
         if not chunk_res:
             logger.warning(f"[Parse] Failed to parse result: {raw}")
             return None
+        # Post-extraction redaction on the structured doc output. The LLM
+        # may have re-quoted user content into `value` / `tags` / etc.
+        chunk_res = redact_dict(chunk_res)
     except Exception as e:
         logger.error(f"[Parse] Exception during JSON parsing: {e}")
         return None
@@ -293,6 +297,13 @@ class SimpleStructMemReader(BaseMemReader, ABC):
             return None
 
     def _get_llm_response(self, mem_str: str, custom_tags: list[str] | None) -> dict:
+        # Pre-extraction redaction: secrets are scrubbed from the conversation
+        # text before it ever reaches the LLM. The extractor never sees the
+        # raw token. Language detection uses the redacted text — a `[REDACTED:
+        # email]` token doesn't change detected language for any practical
+        # input.
+        mem_str = redact(mem_str)
+
         lang = detect_lang(mem_str)
         template = PROMPT_DICT["chat"][lang]
         examples = PROMPT_DICT["chat"][f"{lang}_example"]
@@ -313,6 +324,8 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         response_json = self._safe_parse(response_text)
 
         if not response_json:
+            # mem_str is already redacted above, so the fallback memory_list
+            # carries no raw secrets either.
             return {
                 "memory_list": [
                     {
@@ -325,7 +338,12 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 "summary": mem_str,
             }
 
-        return response_json
+        # Post-extraction redaction: defense in depth. The LLM may have
+        # re-quoted parts of the redacted input verbatim, but it may also
+        # echo back a secret if the prompt was cached or the model
+        # hallucinated one. Run the redactor over every string field of the
+        # structured output before any caller persists it.
+        return redact_dict(response_json)
 
     def _iter_chat_windows(self, scene_data_info, max_tokens=None, overlap=200):
         """
@@ -427,7 +445,10 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                     )
 
             def _build_fast_node(w):
-                text = w["text"]
+                # Fast mode skips the LLM entirely and stores the raw window
+                # text into Qdrant + Neo4j. Without this redact pass, an
+                # `sk-…` key pasted into chat would land verbatim on disk.
+                text = redact(w["text"])
                 roles = {s.get("role", "") for s in w["sources"] if s.get("role")}
                 mem_type = "UserMemory" if roles == {"user"} else "LongTermMemory"
                 # Preserve the mode tag (downstream scheduler/feedback code filters on
@@ -986,6 +1007,10 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         if not text_content:
             logger.warning("[DocReader] Empty document text after normalization.")
             return []
+
+        # Pre-extraction redaction for the doc path: chunk + LLM operate on
+        # already-redacted text, mirroring the chat fine-mode pipeline.
+        text_content = redact(text_content)
 
         chunks = self.chunker.chunk(text_content)
         messages = []
