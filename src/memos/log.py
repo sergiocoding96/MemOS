@@ -21,6 +21,7 @@ from memos.context.context import (
     get_current_user_name,
     get_current_user_type,
 )
+from memos.core.redactor import redact
 
 
 # Load environment variables
@@ -58,6 +59,37 @@ class ContextFilter(logging.Filter):
             record.env = "prod"
             record.user_type = "normal"
             record.user_name = "unknown"
+        return True
+
+
+class RedactionFilter(logging.Filter):
+    """Defense-in-depth: scrub secrets out of every log record before any
+    handler emits it.
+
+    Explicit ``redact()`` calls at log-call sites are preferred (they preserve
+    log args for structured handlers), but this filter catches anything that
+    slipped through — third-party libraries logging request bodies, exception
+    tracebacks that quote payloads, etc.
+
+    Implementation note: we resolve ``record.getMessage()`` (which applies
+    ``record.msg % record.args``), redact the resolved string, and write it
+    back to ``record.msg``, clearing ``record.args``. Subsequent handlers
+    therefore see the redacted text in both ``record.msg`` and
+    ``record.getMessage()``.
+    """
+
+    def filter(self, record):
+        try:
+            original = record.getMessage()
+        except Exception:
+            return True
+        try:
+            redacted = redact(original)
+        except Exception:
+            return True
+        if redacted is not original and redacted != original:
+            record.msg = redacted
+            record.args = ()
         return True
 
 
@@ -186,6 +218,10 @@ LOGGING_CONFIG = {
     "filters": {
         "package_tree_filter": {"()": "logging.Filter", "name": settings.LOG_FILTER_TREE_PREFIX},
         "context_filter": {"()": "memos.log.ContextFilter"},
+        # Redaction must run BEFORE any other filter that reads the message
+        # text, and BEFORE any handler emits. dictConfig applies filters in
+        # the listed order on each handler.
+        "redaction_filter": {"()": "memos.log.RedactionFilter"},
     },
     "handlers": {
         "console": {
@@ -193,7 +229,7 @@ LOGGING_CONFIG = {
             "class": "logging.StreamHandler",
             "stream": stdout,
             "formatter": "no_datetime",
-            "filters": ["package_tree_filter", "context_filter"],
+            "filters": ["redaction_filter", "package_tree_filter", "context_filter"],
         },
         "file": {
             "level": "INFO",
@@ -203,17 +239,22 @@ LOGGING_CONFIG = {
             "backupCount": 3,
             "filename": _setup_logfile(),
             "formatter": "standard",
-            "filters": ["context_filter"],
+            "filters": ["redaction_filter", "context_filter"],
         },
         "custom_logger": {
             "level": "INFO",
             "class": "memos.log.CustomLoggerRequestHandler",
             "formatter": "simplified",
+            "filters": ["redaction_filter"],
         },
     },
     "root": {  # Root logger handles all logs
         "level": logging.DEBUG if settings.DEBUG else logging.INFO,
         "handlers": ["console", "file"],
+        # Logger-level filters fire once before the record fans out to every
+        # handler, so every downstream handler — including any added later by
+        # third-party code — sees the already-redacted record.
+        "filters": ["redaction_filter"],
     },
     "loggers": {
         "memos": {
