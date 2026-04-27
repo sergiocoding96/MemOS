@@ -40,7 +40,9 @@ from memos.mem_scheduler.schemas.general_schemas import (
 )
 from memos.mem_scheduler.task_schedule_modules.dispatcher import SchedulerDispatcher
 from memos.mem_scheduler.task_schedule_modules.orchestrator import SchedulerOrchestrator
+from memos.mem_scheduler.task_schedule_modules.retry_worker import RetryWorker
 from memos.mem_scheduler.task_schedule_modules.task_queue import ScheduleTaskQueue
+from memos.storage.retry_queue import RetryQueue
 from memos.mem_scheduler.utils import metrics
 from memos.mem_scheduler.utils.status_tracker import TaskStatusTracker
 from memos.mem_scheduler.webservice_modules.rabbitmq_service import RabbitMQSchedulerModule
@@ -142,6 +144,23 @@ class BaseScheduler(
             orchestrator=self.orchestrator,
             status_tracker=self._status_tracker,
         )
+        # Bug 2 follow-up: construct the durable retry queue alongside the
+        # dispatcher so failed extraction tasks survive process restarts.
+        # Set MEMOS_RETRY_QUEUE_DISABLED=1 to skip construction entirely
+        # (e.g., for unit tests that build a full scheduler without wanting
+        # the SQLite side-effect on disk). The worker thread is gated
+        # separately by RetryWorker via MEMOS_RETRY_WORKER_DISABLED.
+        if os.getenv("MEMOS_RETRY_QUEUE_DISABLED") == "1":
+            self.retry_queue: RetryQueue | None = None
+        else:
+            try:
+                self.retry_queue = RetryQueue()
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning(
+                    "RetryQueue construction failed (%s); durable retries disabled",
+                    e,
+                )
+                self.retry_queue = None
         self.dispatcher = SchedulerDispatcher(
             config=self.config,
             memos_message_queue=self.memos_message_queue,
@@ -151,7 +170,11 @@ class BaseScheduler(
             metrics=self.metrics,
             submit_web_logs=self._submit_web_logs,
             orchestrator=self.orchestrator,
+            retry_queue=self.retry_queue,
         )
+        # RetryWorker is created here but does not start until self.start();
+        # keeping it here means it sees the same dispatcher instance.
+        self._retry_worker = RetryWorker(self)
         # Task schedule monitor: initialize with underlying queue implementation
         self.get_status_parallel = self.config.get("get_status_parallel", True)
         self.task_schedule_monitor = TaskScheduleMonitor(

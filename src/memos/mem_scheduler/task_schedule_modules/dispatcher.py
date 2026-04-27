@@ -27,6 +27,8 @@ from memos.mem_scheduler.task_schedule_modules.task_queue import ScheduleTaskQue
 from memos.mem_scheduler.utils.misc_utils import group_messages_by_user_and_mem_cube, is_cloud_env
 from memos.mem_scheduler.utils.monitor_event_utils import emit_monitor_event, to_iso
 from memos.mem_scheduler.utils.status_tracker import TaskStatusTracker
+from memos.storage.exceptions import DependencyUnavailable
+from memos.storage.retry_queue import RetryQueue
 
 
 logger = get_logger(__name__)
@@ -55,9 +57,17 @@ class SchedulerDispatcher(BaseSchedulerModule):
         metrics: Any | None = None,
         submit_web_logs: Callable | None = None,  # ADDED
         orchestrator: SchedulerOrchestrator | None = None,
+        retry_queue: RetryQueue | None = None,
     ):
         super().__init__()
         self.config = config
+        # Bug 2 fix: when a handler raises a dependency-class error
+        # (Qdrant/Neo4j unreachable), the failing message is enqueued to a
+        # durable SQLite retry queue instead of being silently dropped.
+        # The actual retry-side handler is wired by the caller via
+        # start_retry_worker(handler) — the dispatcher never assumes who
+        # owns reconstruction of mem_cube objects.
+        self.retry_queue = retry_queue
 
         # Main dispatcher thread pool
         self.max_workers = max_workers
@@ -239,6 +249,26 @@ class SchedulerDispatcher(BaseSchedulerModule):
                             task_id=msg.item_id, user_id=msg.user_id, error_message=str(e)
                         )
                     self._maybe_emit_task_completion(messages, error=e)
+
+                # Bug 2 fix: if a dependency outage caused this failure,
+                # enqueue the message into the durable retry queue so the
+                # async write isn't silently lost. We only enqueue for
+                # recognized dependency-class errors — we do NOT retry
+                # programming errors (those would loop forever).
+                if self.retry_queue is not None and self._should_retry(e):
+                    for msg in messages:
+                        try:
+                            payload = self._serialize_message_for_retry(msg, original_error=e)
+                            self.retry_queue.enqueue(
+                                label=f"retry::{msg.label}",
+                                payload=payload,
+                            )
+                        except Exception as enq_err:  # pragma: no cover — defensive
+                            logger.error(
+                                f"[SchedulerDispatcher] failed to enqueue retry for "
+                                f"item_id={getattr(msg, 'item_id', '?')}: {enq_err}",
+                                exc_info=True,
+                            )
                 emit_monitor_event(
                     "finish",
                     m,
@@ -285,6 +315,92 @@ class SchedulerDispatcher(BaseSchedulerModule):
                         logger.warning(f"Ack in finally failed: {ack_err}")
 
         return wrapped_handler
+
+    # ──────────────────────────────────────────────────────────────────
+    # Bug 2 fix: durable retry plumbing
+    # ──────────────────────────────────────────────────────────────────
+
+    def _should_retry(self, exc: BaseException) -> bool:
+        """Return True iff `exc` represents a transient dependency outage
+        worth retrying. We deliberately *do not* retry generic Exceptions —
+        a dead-letter loop on a programming error would be worse than a drop.
+        """
+        # Direct match
+        if isinstance(exc, DependencyUnavailable):
+            return True
+        # Walk the cause chain so wrapped errors still count
+        cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+        if cause is not None and cause is not exc:
+            return self._should_retry(cause)
+        # Recognized neo4j connection-class names (sniffed by name to avoid
+        # importing neo4j unconditionally)
+        if type(exc).__module__.startswith("neo4j") and type(exc).__name__ in {
+            "ServiceUnavailable",
+            "RoutingServiceUnavailable",
+            "WriteServiceUnavailable",
+            "ReadServiceUnavailable",
+            "DatabaseUnavailable",
+            "ConnectionAcquisitionTimeoutError",
+            "SessionExpired",
+        }:
+            return True
+        return False
+
+    @staticmethod
+    def _serialize_message_for_retry(
+        msg: ScheduleMessageItem, *, original_error: BaseException
+    ) -> dict[str, Any]:
+        """Serialize the durable subset of a ScheduleMessageItem for the
+        retry queue. We deliberately skip live in-process objects like
+        `mem_cube` — the retry handler must rehydrate those via its own
+        registry given mem_cube_id.
+        """
+        ts = getattr(msg, "timestamp", None)
+        return {
+            "item_id": getattr(msg, "item_id", None),
+            "user_id": msg.user_id,
+            "mem_cube_id": msg.mem_cube_id,
+            "session_id": getattr(msg, "session_id", "") or "",
+            "label": msg.label,
+            "content": msg.content,
+            "user_name": getattr(msg, "user_name", "") or "",
+            "task_id": getattr(msg, "task_id", None),
+            "info": getattr(msg, "info", None),
+            "chat_history": getattr(msg, "chat_history", None),
+            "trace_id": getattr(msg, "trace_id", None),
+            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else None,
+            "_retry_meta": {
+                "original_error_type": type(original_error).__name__,
+                "original_error_msg": str(original_error)[:512],
+            },
+        }
+
+    def start_retry_worker(
+        self,
+        handler: Callable[[str, dict[str, Any]], None],
+        *,
+        thread_name: str = "memos-scheduler-retry",
+    ) -> None:
+        """Start the retry queue's background worker.
+
+        `handler(label, payload)` is called for each due retry. The handler
+        is responsible for: (a) rehydrating the mem_cube via its mem_cube_id
+        from the payload, (b) calling the original message handler, (c)
+        raising on continued failure (which triggers another retry / dead
+        letter). The dispatcher does NOT call its own handler chain
+        automatically — that decision is the caller's so they can inject
+        test fakes and pick the right scheduler instance.
+        """
+        if self.retry_queue is None:
+            logger.warning(
+                "[SchedulerDispatcher] start_retry_worker called but retry_queue is None"
+            )
+            return
+        self.retry_queue.start_worker(handler, thread_name=thread_name)
+
+    def stop_retry_worker(self, timeout: float = 5.0) -> None:
+        if self.retry_queue is not None:
+            self.retry_queue.stop_worker(timeout=timeout)
 
     def _maybe_emit_task_completion(
         self, messages: list[ScheduleMessageItem], error: Exception | None = None

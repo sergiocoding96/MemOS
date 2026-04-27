@@ -268,6 +268,16 @@ class BaseSchedulerQueueMixin:
         self.start_consumer()
         self.start_background_monitor()
 
+        # Bug 2 follow-up: spin up the retry worker daemon. This drains the
+        # durable SQLite queue against the live mem_cube registry. Default-on;
+        # set MEMOS_RETRY_WORKER_DISABLED=1 to opt out (e.g., in tests).
+        retry_worker = getattr(self, "_retry_worker", None)
+        if retry_worker is not None:
+            try:
+                retry_worker.start()
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning("RetryWorker.start() failed: %s", e, exc_info=True)
+
     def start_background_monitor(self):
         if self._monitor_thread and self._monitor_thread.is_alive():
             return
@@ -341,6 +351,15 @@ class BaseSchedulerQueueMixin:
 
         if self._monitor_thread:
             self._monitor_thread.join(timeout=2.0)
+
+        # Stop the retry worker before tearing down the dispatcher so any
+        # in-flight retry attempt completes against the still-live registry.
+        retry_worker = getattr(self, "_retry_worker", None)
+        if retry_worker is not None:
+            try:
+                retry_worker.stop()
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning("RetryWorker.stop() failed: %s", e, exc_info=True)
 
         if self.dispatcher:
             logger.info("Shutting down dispatcher...")

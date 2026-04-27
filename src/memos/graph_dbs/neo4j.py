@@ -125,10 +125,24 @@ class Neo4jGraphDB(BaseGraphDB):
             All node queries will enforce `user_name` in WHERE conditions and store it in metadata,
             but it will be removed automatically before returning to external consumers.
         """
+        import os as _os
+
         from neo4j import GraphDatabase
 
         self.config = config
-        self.driver = GraphDatabase.driver(config.uri, auth=(config.user, config.password))
+        # Bug 2 fix: bound connection acquisition + transaction retries so a
+        # dead Neo4j surfaces quickly as a connection-class exception that the
+        # API layer can convert to HTTP 503, rather than parking the request
+        # thread until something else times out. Defaults are conservative;
+        # override via env for testing or to match deployment SLAs.
+        connection_timeout = float(_os.environ.get("MEMOS_NEO4J_CONNECTION_TIMEOUT_S", "5.0"))
+        max_tx_retry_time = float(_os.environ.get("MEMOS_NEO4J_MAX_TX_RETRY_TIME_S", "10.0"))
+        self.driver = GraphDatabase.driver(
+            config.uri,
+            auth=(config.user, config.password),
+            connection_timeout=connection_timeout,
+            max_transaction_retry_time=max_tx_retry_time,
+        )
         self.db_name = config.db_name
         self.user_name = config.user_name
 

@@ -1,13 +1,63 @@
-from typing import Any
+import os
+import time
+
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from memos.configs.vec_db import QdrantVecDBConfig
 from memos.dependency import require_python_package
 from memos.log import get_logger
+from memos.storage.exceptions import QdrantUnavailable
 from memos.vec_dbs.base import BaseVecDB
 from memos.vec_dbs.item import VecDBItem
 
 
 logger = get_logger(__name__)
+
+T = TypeVar("T")
+
+# Connection-level errors mean Qdrant is unreachable. We classify by class
+# name + module rather than importing the qdrant exception classes so this
+# module stays importable when qdrant_client is absent (it's optional in
+# some MemOS deployments). HTTP 5xx and connection refused / timeouts all
+# count; 4xx (auth, bad request) are programming errors and propagate.
+_UNAVAILABLE_EXCEPTION_NAMES = frozenset(
+    {
+        "ConnectionError",       # urllib3 / requests
+        "ConnectTimeout",
+        "ReadTimeout",
+        "Timeout",
+        "TimeoutError",
+        "NewConnectionError",
+        "MaxRetryError",
+        "ProtocolError",
+        "RemoteDisconnected",
+        "ResponseHandlingException",  # qdrant-client httpx wrapper
+        "ConnectError",               # httpx
+        "ConnectTimeout",
+        "ReadError",
+        "WriteError",
+    }
+)
+
+
+def _is_unavailable_error(exc: BaseException) -> bool:
+    """True if this exception means 'Qdrant is unreachable' rather than
+    'caller asked for something invalid'. We err on the side of *not*
+    retrying — only mark unavailable when we recognize a connection-class
+    failure or a 5xx response."""
+    # Recognized exception class
+    if type(exc).__name__ in _UNAVAILABLE_EXCEPTION_NAMES:
+        return True
+    # qdrant-client raises UnexpectedResponse with .status_code on HTTP errors
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status >= 500:
+        return True
+    # Walk the cause chain for wrapped connection errors
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause is not None and cause is not exc:
+        return _is_unavailable_error(cause)
+    return False
 
 
 class QdrantVecDB(BaseVecDB):
@@ -58,6 +108,14 @@ class QdrantVecDB(BaseVecDB):
                     "(e.g., via Docker: https://qdrant.tech/documentation/quickstart/)."
                 )
 
+        # Bug 2 fix: bound every network call so a hung Qdrant doesn't park
+        # the API request thread forever. Default 5s; override via env for
+        # debugging. The QdrantClient `timeout` kwarg is the per-request
+        # HTTP timeout in seconds.
+        self._network_timeout_s = float(os.environ.get("MEMOS_QDRANT_TIMEOUT_S", "5.0"))
+        self._retry_attempts = int(os.environ.get("MEMOS_QDRANT_RETRY_ATTEMPTS", "3"))
+        client_kwargs.setdefault("timeout", self._network_timeout_s)
+
         self.client = QdrantClient(**client_kwargs)
         self.create_collection()
         # Ensure common payload indexes exist (idempotent)
@@ -65,6 +123,38 @@ class QdrantVecDB(BaseVecDB):
             self.ensure_payload_indexes(self._default_payload_index_fields)
         except Exception as e:
             logger.warning(f"Failed to ensure default payload indexes: {e}")
+
+    def _with_retry(self, op_name: str, fn: Callable[[], T]) -> T:
+        """Run `fn` with bounded exponential retries on connection-class errors.
+
+        Programming errors (4xx, value errors, missing collection, etc.)
+        propagate immediately. Connection-class errors retry up to
+        `self._retry_attempts` times with 0.25, 0.5, 1.0, 2.0... s backoff.
+        After exhausting retries, raise QdrantUnavailable so the API layer
+        can return HTTP 503.
+        """
+        last_exc: BaseException | None = None
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                if not _is_unavailable_error(exc):
+                    raise
+                last_exc = exc
+                if attempt >= self._retry_attempts:
+                    break
+                delay = min(2.0, 0.25 * (2 ** (attempt - 1)))
+                logger.warning(
+                    f"[QdrantVecDB] {op_name} failed (attempt {attempt}/"
+                    f"{self._retry_attempts}): {type(exc).__name__}: {exc}; "
+                    f"retrying in {delay:.2f}s"
+                )
+                time.sleep(delay)
+        # All retries exhausted on a connection-class error → escalate.
+        raise QdrantUnavailable(
+            f"Qdrant unreachable during {op_name} after {self._retry_attempts} attempts",
+            cause=last_exc,
+        )
 
     def create_collection(self) -> None:
         """Create a new collection with specified parameters."""
@@ -142,13 +232,16 @@ class QdrantVecDB(BaseVecDB):
             List of search results with distance scores and payloads.
         """
         qdrant_filter = self._dict_to_filter(filter) if filter else None
-        response = self.client.query_points(
-            collection_name=self.config.collection_name,
-            query=query_vector,
-            limit=top_k,
-            query_filter=qdrant_filter,
-            with_vectors=True,
-            with_payload=True,
+        response = self._with_retry(
+            "query_points",
+            lambda: self.client.query_points(
+                collection_name=self.config.collection_name,
+                query=query_vector,
+                limit=top_k,
+                query_filter=qdrant_filter,
+                with_vectors=True,
+                with_payload=True,
+            ),
         ).points
         logger.info(f"Qdrant search completed with {len(response)} results.")
         return [
@@ -178,11 +271,14 @@ class QdrantVecDB(BaseVecDB):
 
     def get_by_id(self, id: str) -> VecDBItem | None:
         """Get a single item by ID."""
-        response = self.client.retrieve(
-            collection_name=self.config.collection_name,
-            ids=[id],
-            with_payload=True,
-            with_vectors=True,
+        response = self._with_retry(
+            "retrieve_one",
+            lambda: self.client.retrieve(
+                collection_name=self.config.collection_name,
+                ids=[id],
+                with_payload=True,
+                with_vectors=True,
+            ),
         )
 
         if not response:
@@ -197,11 +293,14 @@ class QdrantVecDB(BaseVecDB):
 
     def get_by_ids(self, ids: list[str]) -> list[VecDBItem]:
         """Get multiple items by their IDs."""
-        response = self.client.retrieve(
-            collection_name=self.config.collection_name,
-            ids=ids,
-            with_payload=True,
-            with_vectors=True,
+        response = self._with_retry(
+            "retrieve_many",
+            lambda: self.client.retrieve(
+                collection_name=self.config.collection_name,
+                ids=ids,
+                with_payload=True,
+                with_vectors=True,
+            ),
         )
 
         if not response:
@@ -233,13 +332,16 @@ class QdrantVecDB(BaseVecDB):
 
         # Use scroll to paginate through all matching points
         while True:
-            points, offset = self.client.scroll(
-                collection_name=self.config.collection_name,
-                limit=scroll_limit,
-                scroll_filter=qdrant_filter,
-                offset=offset,
-                with_vectors=True,
-                with_payload=True,
+            points, offset = self._with_retry(
+                "scroll",
+                lambda offset=offset: self.client.scroll(
+                    collection_name=self.config.collection_name,
+                    limit=scroll_limit,
+                    scroll_filter=qdrant_filter,
+                    offset=offset,
+                    with_vectors=True,
+                    with_payload=True,
+                ),
             )
 
             if not points:
@@ -271,8 +373,11 @@ class QdrantVecDB(BaseVecDB):
         if filter:
             qdrant_filter = self._dict_to_filter(filter)
 
-        response = self.client.count(
-            collection_name=self.config.collection_name, count_filter=qdrant_filter
+        response = self._with_retry(
+            "count",
+            lambda: self.client.count(
+                collection_name=self.config.collection_name, count_filter=qdrant_filter
+            ),
         )
 
         return response.count
@@ -297,7 +402,12 @@ class QdrantVecDB(BaseVecDB):
             point = models.PointStruct(id=item.id, vector=item.vector, payload=item.payload)
             points.append(point)
 
-        self.client.upsert(collection_name=self.config.collection_name, points=points)
+        self._with_retry(
+            "upsert",
+            lambda: self.client.upsert(
+                collection_name=self.config.collection_name, points=points
+            ),
+        )
 
     def update(self, id: str, data: VecDBItem | dict[str, Any]) -> None:
         """Update an item in the vector database."""
@@ -309,14 +419,22 @@ class QdrantVecDB(BaseVecDB):
 
         if data.vector:
             # For vector updates (with or without payload), use upsert with the same ID
-            self.client.upsert(
-                collection_name=self.config.collection_name,
-                points=[models.PointStruct(id=id, vector=data.vector, payload=data.payload)],
+            self._with_retry(
+                "update_upsert",
+                lambda: self.client.upsert(
+                    collection_name=self.config.collection_name,
+                    points=[models.PointStruct(id=id, vector=data.vector, payload=data.payload)],
+                ),
             )
         else:
             # For payload-only updates
-            self.client.set_payload(
-                collection_name=self.config.collection_name, payload=data.payload, points=[id]
+            self._with_retry(
+                "set_payload",
+                lambda: self.client.set_payload(
+                    collection_name=self.config.collection_name,
+                    payload=data.payload,
+                    points=[id],
+                ),
             )
 
     def ensure_payload_indexes(self, fields: list[str]) -> None:
@@ -353,7 +471,10 @@ class QdrantVecDB(BaseVecDB):
 
         """Delete items from the vector database."""
         point_ids: list[str | int] = ids
-        self.client.delete(
-            collection_name=self.config.collection_name,
-            points_selector=models.PointIdsList(points=point_ids),
+        self._with_retry(
+            "delete",
+            lambda: self.client.delete(
+                collection_name=self.config.collection_name,
+                points_selector=models.PointIdsList(points=point_ids),
+            ),
         )
