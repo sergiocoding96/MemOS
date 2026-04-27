@@ -93,6 +93,14 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                     },
                 )
                 self.vec_db.add([item])
+            except DependencyUnavailable:
+                # Qdrant outage on a write: re-raise so the API surfaces 503
+                # and the scheduler dispatcher enqueues the message into the
+                # retry queue. Marking the node `vector_sync=failed` in
+                # Neo4j-only is the original silent-loss path that PR #8 was
+                # meant to close — but the typed exception was being eaten
+                # here before it could reach the dispatcher.
+                raise
             except Exception as e:
                 logger.warning(f"[VecDB] Vector insert failed for node {id}: {e}")
                 vector_sync_status = "failed"
@@ -193,6 +201,12 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
 
         try:
             self.vec_db.add(vec_items)
+        except DependencyUnavailable:
+            # Same rationale as the single-node `add_node` path above: a
+            # Qdrant outage on a batch write must surface to the dispatcher
+            # so the retry queue can replay it. Quietly tagging every node
+            # `vector_sync=failed` and continuing is the silent-loss bug.
+            raise
         except Exception as e:
             logger.warning(f"[VecDB] batch insert failed: {e}")
             for node in prepared_nodes:
@@ -361,6 +375,13 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                 vec_results = self.vec_db.search(
                     query_vector=vector, top_k=top_k, filter=vec_filter
                 )
+            except DependencyUnavailable:
+                # Qdrant outage during similarity search: re-raise. Returning
+                # an empty `vec_results` here causes write-path dedup callers
+                # to behave as if "no neighbors found" — which silently
+                # corrupts the dedup decision and writes near-duplicates.
+                # Fail loud so the API returns 503 instead.
+                raise
             except Exception as e:
                 logger.warning(f"[VecDB] search failed: {e}")
 

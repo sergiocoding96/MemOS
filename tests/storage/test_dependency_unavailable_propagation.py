@@ -182,3 +182,125 @@ def test_dependency_unavailable_imported_in_patched_modules(module_path):
         f"{module_path} imports DependencyUnavailable but has no "
         f"`except DependencyUnavailable` clause"
     )
+
+
+# ---------------------------------------------------------------------------
+# Neo4jCommunityGraphDB driver — write + search paths
+# ---------------------------------------------------------------------------
+#
+# The earlier PR covered the read paths (``get_node`` / ``get_nodes_batch``).
+# These cover the write side (``add_node`` / ``add_nodes_batch``) and the
+# similarity-search path used by write-side dedup. Without these, a Qdrant
+# outage during a write would be tagged ``vector_sync=failed`` in Neo4j-only
+# and the API would return HTTP 200 — exactly the silent-loss path the
+# resilience work was meant to close.
+
+
+def _make_neo4j_db_with_failing_vec_db(side_effect: BaseException):
+    """Build a Neo4jCommunityGraphDB stub whose vec_db raises ``side_effect``
+    on add / search. We bypass __init__ (real init opens TCP connections)
+    and only wire the attributes the tested methods touch.
+    """
+    from memos.graph_dbs.neo4j_community import Neo4jCommunityGraphDB
+
+    db = Neo4jCommunityGraphDB.__new__(Neo4jCommunityGraphDB)
+    db.vec_db = MagicMock()
+    db.vec_db.add.side_effect = side_effect
+    db.vec_db.search.side_effect = side_effect
+    # Some tests touch the Neo4j driver too; give it a no-op mock so
+    # raising from vec_db is what dominates the call path.
+    db.driver = MagicMock()
+    db.embedder = MagicMock()
+    db.config = MagicMock()
+    db.config.user_name = "alice"
+    return db
+
+
+def test_add_node_propagates_qdrant_unavailable():
+    """``add_node`` writes to vec_db before the Neo4j MERGE. A Qdrant
+    outage there used to be tagged ``vector_sync=failed`` silently — the
+    typed exception must now propagate."""
+    from memos.graph_dbs.neo4j_community import Neo4jCommunityGraphDB
+
+    db = _make_neo4j_db_with_failing_vec_db(QdrantUnavailable("write blip"))
+
+    # Drive only the vec_db block: bind add_node and call it; we expect
+    # the typed exception to propagate before reaching the Neo4j query.
+    add_node = Neo4jCommunityGraphDB.add_node.__get__(db, Neo4jCommunityGraphDB)
+    with pytest.raises(QdrantUnavailable):
+        add_node(
+            id="11111111-1111-1111-1111-111111111111",
+            memory="hello",
+            metadata={
+                "embedding": [0.1] * 8,
+                "created_at": "2026-04-27T00:00:00",
+                "updated_at": "2026-04-27T00:00:00",
+            },
+        )
+
+
+def test_add_nodes_batch_propagates_qdrant_unavailable():
+    """Batch insert path. Same invariant as ``add_node``."""
+    from memos.graph_dbs.neo4j_community import Neo4jCommunityGraphDB
+
+    db = _make_neo4j_db_with_failing_vec_db(QdrantUnavailable("batch blip"))
+
+    add_nodes_batch = Neo4jCommunityGraphDB.add_nodes_batch.__get__(
+        db, Neo4jCommunityGraphDB
+    )
+    nodes = [
+        {
+            "id": f"{i:08d}-1111-1111-1111-111111111111",
+            "memory": f"hello-{i}",
+            "metadata": {
+                "embedding": [0.1] * 8,
+                "created_at": "2026-04-27T00:00:00",
+                "updated_at": "2026-04-27T00:00:00",
+            },
+        }
+        for i in range(3)
+    ]
+    with pytest.raises(QdrantUnavailable):
+        add_nodes_batch(nodes)
+
+
+def test_add_node_does_not_widen_typed_catch_to_generic_errors():
+    """Regression guard: ``add_node`` must NOT promote a generic
+    ``ValueError`` from vec_db into ``QdrantUnavailable``. The typed
+    catch added in this PR is narrow on purpose — only typed dep
+    outages should propagate; everything else stays in the existing
+    log-and-tag-as-failed path.
+
+    We assert the *negative*: a generic vec_db error must not surface
+    as ``QdrantUnavailable``. The function may still raise something
+    else further down (the Neo4j MERGE call has its own concerns and
+    we're not mocking the full driver), but it must NOT raise
+    ``QdrantUnavailable`` from a non-typed cause.
+    """
+    from memos.graph_dbs.neo4j_community import Neo4jCommunityGraphDB
+
+    db = _make_neo4j_db_with_failing_vec_db(ValueError("bad vector"))
+
+    add_node = Neo4jCommunityGraphDB.add_node.__get__(db, Neo4jCommunityGraphDB)
+    raised: BaseException | None = None
+    try:
+        add_node(
+            id="11111111-1111-1111-1111-111111111111",
+            memory="hello",
+            metadata={
+                "embedding": [0.1] * 8,
+                "created_at": "2026-04-27T00:00:00",
+                "updated_at": "2026-04-27T00:00:00",
+            },
+        )
+    except BaseException as e:
+        raised = e
+
+    # The vital invariant: whatever (if anything) propagates, it must
+    # not be a ``DependencyUnavailable`` subclass. Anything else means
+    # the typed catch did its job (passed the ValueError through to
+    # the existing logger.warning path).
+    assert not isinstance(raised, DependencyUnavailable), (
+        f"typed catch widened — generic vec_db error became "
+        f"{type(raised).__name__}: {raised}"
+    )
