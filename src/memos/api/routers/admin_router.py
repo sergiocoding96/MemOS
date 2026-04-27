@@ -28,6 +28,12 @@ router = APIRouter(prefix="/admin", tags=["Admin"])
 # Admin auth: a separate env-var key that only the operator knows.
 _ADMIN_KEY = os.getenv("MEMOS_ADMIN_KEY", "")
 
+# BCrypt cost factor for newly-created agent keys (F-03). Must be
+# >= MIN_BCRYPT_COST (10) — the auth middleware refuses to load any
+# hash below that threshold, so generating one here would create a key
+# that can't authenticate after the next server restart.
+BCRYPT_ROUNDS = 12
+
 
 def _require_admin(request: Request):
     """Dependency: reject requests without a valid admin key.
@@ -85,8 +91,20 @@ def _write_config(path: str, data: dict) -> None:
 
 
 def _hash_key(raw_key: str) -> str:
-    """Bcrypt-hash a raw API key."""
-    return bcrypt.hashpw(raw_key.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    """Bcrypt-hash a raw API key.
+
+    Uses ``rounds=BCRYPT_ROUNDS`` explicitly (12 by default, ≥ MIN_BCRYPT_COST
+    enforced by AgentAuthMiddleware._load_config). The bcrypt library's
+    ``gensalt()`` default is also 12 today, but we pin it here so the hash
+    factor is grounded in our own constant rather than the library's
+    moving default — and so any future bump (e.g. to 13) is one symbol to
+    change. Below MIN_BCRYPT_COST the middleware would reject the hash on
+    next startup, so an explicit pin also catches downstream regressions
+    early (a 4-rounds hash would never load).
+    """
+    return bcrypt.hashpw(
+        raw_key.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
+    ).decode("utf-8")
 
 
 # --- Request / Response models ---

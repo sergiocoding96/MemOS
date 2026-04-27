@@ -57,6 +57,37 @@ _authenticated_user: ContextVar[str | None] = ContextVar("authenticated_user", d
 # See: deploy/scripts/setup-memos-agents.py in the Hermes repo.
 KEY_PREFIX_LEN = 12
 
+# Minimum BCrypt cost factor accepted on config load (F-03 from the
+# 2026-04-26 zero-knowledge audit). A hash with rounds<10 takes <50ms to
+# verify, weakening the per-request DoS protection that the rest of the
+# auth path relies on (rate-limit window assumes ~250ms per BCrypt verify).
+# We don't ship anything below this — admin_router uses gensalt() default
+# (rounds=12). The guard is here for the case where an operator manually
+# edits agents-auth.json or imports a hash from a weaker context.
+MIN_BCRYPT_COST = 10
+
+
+def _parse_bcrypt_cost(key_hash: str) -> int | None:
+    """Return the cost factor encoded in a BCrypt hash, or None if the
+    string isn't recognizable as one.
+
+    BCrypt hashes have the shape ``$2<variant>$<cost>$<salt+hash>`` where
+    ``<cost>`` is a two-digit zero-padded integer (04..31). We don't try
+    to validate the rest of the hash — bcrypt.checkpw will surface that
+    later. We just want the cost factor cheaply, before adding the
+    record to the registry.
+    """
+    if not isinstance(key_hash, str):
+        return None
+    if len(key_hash) < 7 or not key_hash.startswith("$2"):
+        return None
+    # ``$2b$12$...`` → cost is at indices 4..6. Use a try/except so a
+    # corrupted hash doesn't crash startup.
+    try:
+        return int(key_hash[4:6])
+    except (ValueError, IndexError):
+        return None
+
 
 def get_authenticated_user() -> str | None:
     """Return the user_id bound to the current request's API key, or None if unauthenticated."""
@@ -135,8 +166,25 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
                 self._unprefixed_agents = []
                 self._is_hashed = True
                 unprefixed_uids: list[str] = []
+                weak_uids: list[str] = []
+                unparseable_uids: list[str] = []
                 for entry in agents:
                     if not entry.get("key_hash"):
+                        continue
+                    # F-03: validate the BCrypt cost factor before trusting
+                    # this hash. A weak hash is auth-effective (bcrypt.checkpw
+                    # still succeeds for the right key) but undermines the
+                    # per-request CPU floor that the rate limiter relies on.
+                    # We skip the entry entirely so a weakened hash can't be
+                    # used to log in — operator must rotate the key.
+                    cost = _parse_bcrypt_cost(entry["key_hash"])
+                    if cost is None:
+                        unparseable_uids.append(entry.get("user_id", "?"))
+                        continue
+                    if cost < MIN_BCRYPT_COST:
+                        weak_uids.append(
+                            f"{entry.get('user_id', '?')}(rounds={cost})"
+                        )
                         continue
                     record = {
                         "key_hash": entry["key_hash"].encode("utf-8"),
@@ -171,6 +219,29 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
                         "the provisioning script.",
                         len(unprefixed_uids),
                         unprefixed_uids,
+                    )
+                if weak_uids:
+                    # F-03: surface weakened hashes loudly. Skipped entries do
+                    # NOT authenticate — operator must rotate the affected key
+                    # via the admin API (which uses the gensalt() default of
+                    # rounds=12) before the agent can log in again.
+                    logger.error(
+                        "[AgentAuth] %d agent record(s) REJECTED for weak "
+                        "BCrypt cost (< %d rounds): %s. These keys cannot "
+                        "authenticate. Rotate them via "
+                        "POST /admin/keys/rotate to issue a fresh hash at "
+                        "the default rounds=12.",
+                        len(weak_uids),
+                        MIN_BCRYPT_COST,
+                        weak_uids,
+                    )
+                if unparseable_uids:
+                    logger.error(
+                        "[AgentAuth] %d agent record(s) REJECTED for "
+                        "unparseable key_hash (not a recognizable BCrypt "
+                        "hash): %s. Check agents-auth.json for corruption.",
+                        len(unparseable_uids),
+                        unparseable_uids,
                     )
             else:
                 # Legacy plaintext format (v1)
