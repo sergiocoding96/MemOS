@@ -93,6 +93,13 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                     },
                 )
                 self.vec_db.add([item])
+            except DependencyUnavailable:
+                # Qdrant outage on a write: re-raise so the API surfaces 503
+                # (and the scheduler dispatcher enqueues a retry on the async
+                # path). Marking the node "vector_sync=failed" in Neo4j-only
+                # was the original silent-loss path Bug 2 was supposed to
+                # close.
+                raise
             except Exception as e:
                 logger.warning(f"[VecDB] Vector insert failed for node {id}: {e}")
                 vector_sync_status = "failed"
@@ -193,6 +200,11 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
 
         try:
             self.vec_db.add(vec_items)
+        except DependencyUnavailable:
+            # Qdrant outage on batch write: re-raise. Same rationale as the
+            # single-node add_node above — surfacing the failure is the only
+            # way the retry queue / API 503 path get to do their job.
+            raise
         except Exception as e:
             logger.warning(f"[VecDB] batch insert failed: {e}")
             for node in prepared_nodes:
@@ -361,6 +373,11 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                 vec_results = self.vec_db.search(
                     query_vector=vector, top_k=top_k, filter=vec_filter
                 )
+            except DependencyUnavailable:
+                # Qdrant outage: re-raise so the API surfaces 503 and the
+                # write-path dedup callers don't proceed with empty
+                # similarity results (which would cause silent data loss).
+                raise
             except Exception as e:
                 logger.warning(f"[VecDB] search failed: {e}")
 
