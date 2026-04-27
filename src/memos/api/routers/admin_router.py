@@ -7,6 +7,7 @@ Protected by a dedicated admin key (MEMOS_ADMIN_KEY env var).
 Produces v2 hashed entries (bcrypt) compatible with AgentAuthMiddleware.
 """
 
+import hmac
 import json
 import os
 import secrets
@@ -29,14 +30,29 @@ _ADMIN_KEY = os.getenv("MEMOS_ADMIN_KEY", "")
 
 
 def _require_admin(request: Request):
-    """Dependency: reject requests without a valid admin key."""
+    """Dependency: reject requests without a valid admin key.
+
+    Uses ``hmac.compare_digest`` for the key comparison so the response
+    timing does not leak character-by-character match information to a
+    network attacker probing for the admin key. Plain ``==`` short-circuits
+    on the first mismatching byte and is timing-distinguishable on the
+    order of nanoseconds — small but real, and free to fix.
+
+    Header parsing (presence, scheme, split) intentionally short-circuits
+    before the comparison: those branches do not depend on the key value
+    so they are not a side channel.
+    """
     if not _ADMIN_KEY:
         raise HTTPException(status_code=503, detail="Admin API not configured (MEMOS_ADMIN_KEY not set)")
     auth = request.headers.get("Authorization", "").strip()
     if not auth:
         raise HTTPException(status_code=401, detail="Admin key required: Authorization: Bearer <admin-key>")
     parts = auth.split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1].strip() != _ADMIN_KEY:
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    presented = parts[1].strip().encode("utf-8")
+    expected = _ADMIN_KEY.encode("utf-8")
+    if not hmac.compare_digest(presented, expected):
         raise HTTPException(status_code=401, detail="Invalid admin key")
 
 
