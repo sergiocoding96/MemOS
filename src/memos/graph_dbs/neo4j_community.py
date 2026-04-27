@@ -12,6 +12,7 @@ from memos.graph_dbs.neo4j import (
     _sanitize_neo4j_metadata,
 )
 from memos.log import get_logger
+from memos.storage.exceptions import DependencyUnavailable
 from memos.vec_dbs.factory import VecDBFactory
 from memos.vec_dbs.item import VecDBItem
 
@@ -1189,6 +1190,12 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
             vec_item = self.vec_db.get_by_id(new_node["id"])
             if vec_item and vec_item.vector:
                 new_node["metadata"]["embedding"] = vec_item.vector
+        except DependencyUnavailable:
+            # Qdrant outage: re-raise so the API layer surfaces 503 instead
+            # of silently returning a node without its embedding (which
+            # downstream code may treat as "no vector" and proceed
+            # incorrectly).
+            raise
         except Exception as e:
             logger.warning(f"Failed to fetch vector for node {new_node['id']}: {e}")
             new_node["metadata"]["embedding"] = None
@@ -1231,6 +1238,8 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
             try:
                 vec_items = self.vec_db.get_by_ids(node_ids)
                 vec_items_map = {v.id: v.vector for v in vec_items if v and v.vector}
+            except DependencyUnavailable:
+                raise
             except Exception as e:
                 logger.warning(f"Failed to batch fetch vectors for {len(node_ids)} nodes: {e}")
 

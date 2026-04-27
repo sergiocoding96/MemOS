@@ -18,6 +18,7 @@ from memos.mem_scheduler.task_schedule_modules.base_handler import BaseScheduler
 from memos.mem_scheduler.utils.filter_utils import transform_name_to_key
 from memos.mem_scheduler.utils.misc_utils import is_cloud_env
 from memos.memories.textual.tree import TreeTextMemory
+from memos.storage.exceptions import DependencyUnavailable
 
 
 logger = get_logger(__name__)
@@ -39,13 +40,21 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             "[DIAGNOSTIC] mem_read_handler batch_handler called. Batch size: %s", len(batch)
         )
 
+        first_dep_error: DependencyUnavailable | None = None
         with ContextThreadPoolExecutor(max_workers=min(8, len(batch))) as executor:
             futures = [executor.submit(self.process_message, msg) for msg in batch]
             for future in concurrent.futures.as_completed(futures):
                 try:
                     future.result()
+                except DependencyUnavailable as dep_err:
+                    # Capture the first dep outage; re-raise after the rest of
+                    # the batch drains so we don't leak threads.
+                    if first_dep_error is None:
+                        first_dep_error = dep_err
                 except Exception as e:
                     logger.error("Thread task failed: %s", e, stack_info=True)
+        if first_dep_error is not None:
+            raise first_dep_error
 
     def process_message(self, message: ScheduleMessageItem):
         try:
@@ -102,6 +111,12 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                 mem_cube_id,
             )
 
+        except DependencyUnavailable:
+            # Storage outage: re-raise so the dispatcher's task wrapper sees
+            # the failure and enqueues this message into the durable retry
+            # queue. Swallowing here is what made async writes vanish during
+            # a Qdrant/Neo4j blip.
+            raise
         except Exception as e:
             logger.error("Error processing mem_read message: %s", e, stack_info=True)
 
@@ -140,6 +155,8 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                 try:
                     memory_item = text_mem.get(mem_id, user_name=user_name)
                     memory_items.append(memory_item)
+                except DependencyUnavailable:
+                    raise
                 except Exception as e:
                     logger.warning(
                         "[_process_memories_with_reader] Failed to get memory %s: %s", mem_id, e
@@ -172,6 +189,8 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                     chat_history=chat_history,
                     user_context=user_context,
                 )
+            except DependencyUnavailable:
+                raise
             except Exception as e:
                 logger.warning("%s: Fail to transfer mem: %s", e, memory_items)
                 processed_memories = []
@@ -235,6 +254,8 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                                             "[Scheduler] Archived merged_from memory: %s",
                                             old_id,
                                         )
+                                    except DependencyUnavailable:
+                                        raise
                                     except Exception as e:
                                         logger.warning(
                                             "[Scheduler] Failed to archive merged_from memory %s: %s",
@@ -390,6 +411,8 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                     logger.info(
                         "Delete raw/working mem_ids: %s for user_name: %s", delete_ids, user_name
                     )
+                except DependencyUnavailable:
+                    raise
                 except Exception as e:
                     logger.warning("Failed to delete some mem_ids %s: %s", delete_ids, e)
             else:
@@ -399,6 +422,10 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             logger.info("Remove and Refresh Memories")
             logger.debug("Finished add %s memory: %s", user_id, mem_ids)
 
+        except DependencyUnavailable:
+            # Storage outage: re-raise so the dispatcher's task wrapper catches
+            # this and enqueues the message into the durable retry queue.
+            raise
         except Exception as exc:
             logger.error(
                 "Error in _process_memories_with_reader: %s",
