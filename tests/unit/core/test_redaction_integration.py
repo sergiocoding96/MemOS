@@ -290,3 +290,54 @@ def test_fast_mode_value_is_redacted_before_persistence() -> None:
     assert "sk-test-1234567890ABCDEF" not in val, val
     assert "[REDACTED:bearer]" in val
     assert "[REDACTED:sk-key]" in val
+
+
+# ---------------------------------------------------------------------------
+# 5. Sources-archival channel: secrets must not survive into sources[].content.
+# ---------------------------------------------------------------------------
+
+
+def test_iter_chat_windows_redacts_sources_content() -> None:
+    """``_iter_chat_windows`` builds the ``sources[]`` payload that gets
+    persisted verbatim into Qdrant + Neo4j alongside the extracted memory.
+    Earlier redaction passes scrub the LLM prompt (``text``) and the LLM
+    output, but the parallel sources channel had no redact pass — so a
+    bearer/sk-key pasted into chat still landed raw in storage. This is a
+    regression test for that gap.
+    """
+    from memos.mem_reader.simple_struct import SimpleStructMemReader
+
+    reader = SimpleStructMemReader.__new__(SimpleStructMemReader)
+    reader._count_tokens = lambda s: max(1, len(s) // 4)
+    reader.chat_window_max_tokens = 10000
+
+    scene = [
+        {
+            "role": "user",
+            "content": "leaked Bearer abc123def456ghi789 and sk-test-1234567890ABCDEF",
+            "chat_time": "10:00 AM",
+        },
+        {
+            "role": "assistant",
+            "content": "ack alice@example.com",
+            "chat_time": "10:01 AM",
+        },
+    ]
+
+    windows = list(reader._iter_chat_windows(scene))
+    assert windows, "expected at least one window"
+
+    for w in windows:
+        for src in w["sources"]:
+            content = src["content"]
+            assert "abc123def456ghi789" not in content, src
+            assert "sk-test-1234567890ABCDEF" not in content, src
+            assert "alice@example.com" not in content, src
+
+    # Affirmative: at least one source carries the redaction marker, proving
+    # the redact() pass actually fired (rather than the raw text getting
+    # silently dropped).
+    all_contents = " ".join(s["content"] for w in windows for s in w["sources"])
+    assert "[REDACTED:bearer]" in all_contents
+    assert "[REDACTED:sk-key]" in all_contents
+    assert "[REDACTED:email]" in all_contents

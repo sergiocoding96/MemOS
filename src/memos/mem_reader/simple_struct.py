@@ -356,6 +356,15 @@ class SimpleStructMemReader(BaseMemReader, ABC):
             role = item.get("role", "")
             content = item.get("content", "")
             chat_time = item.get("chat_time", None)
+            # Redact secrets at the window-build site. The redacted `content`
+            # flows into both the LLM prompt buffer AND the `sources[]` payload
+            # that gets persisted to Qdrant + Neo4j. Without this pass the
+            # downstream LLM-input redact() (~line 451) protects the prompt
+            # but the parallel sources-archival channel keeps the raw text.
+            # `redact()` is a no-op on non-strings and idempotent on already-
+            # redacted strings, so it composes cleanly with later passes.
+            if isinstance(content, str):
+                content = redact(content)
             parts = []
             if role and str(role).lower() != "mix":
                 parts.append(f"{role}: ")
