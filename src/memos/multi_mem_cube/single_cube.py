@@ -24,6 +24,7 @@ from memos.mem_scheduler.schemas.task_schemas import (
 from memos.memories.textual.item import TextualMemoryItem
 from memos.multi_mem_cube.views import MemCubeView
 from memos.search import search_text_memories
+from memos.storage.exceptions import DependencyUnavailable
 from memos.templates.mem_reader_prompts import PROMPT_MAPPING
 from memos.types.general_types import (
     FINE_STRATEGY,
@@ -578,6 +579,8 @@ class SingleCubeView(MemCubeView):
                 candidates_data.append(
                     {"idx": idx, "new_memory": mem.memory, "related_memories": related_text}
                 )
+            except DependencyUnavailable:
+                raise
             except Exception as e:
                 self.logger.error(
                     f"[add_before_search] Search error for memory '{mem.memory}': {e}"
@@ -644,6 +647,11 @@ class SingleCubeView(MemCubeView):
 
             return filtered_list
 
+        except DependencyUnavailable:
+            # Storage outage during pre-write dedup: re-raise so the API
+            # exception handler converts to 503 (don't proceed with a write
+            # that will silently lose the data).
+            raise
         except Exception as e:
             self.logger.error(f"[add_before_search] LLM execution error: {e}")
             return memory_list
@@ -744,6 +752,11 @@ class SingleCubeView(MemCubeView):
                             f"'{memory.memory[:80]}...' matches existing id={best.get('id', '?')[:8]}"
                         )
                         continue
+                except DependencyUnavailable:
+                    # Storage outage: do NOT swallow — let it propagate so the
+                    # API layer surfaces 503 and the scheduler dispatcher can
+                    # enqueue the task into the durable retry queue.
+                    raise
                 except Exception as e:
                     logger.warning(f"[DEDUP] Vector search failed, keeping memory: {e}")
             deduped_mem_group.append(memory)
@@ -809,6 +822,8 @@ class SingleCubeView(MemCubeView):
                                 self.logger.info(
                                     f"[SingleCubeView] Archived merged_from memory: {old_id}"
                                 )
+                            except DependencyUnavailable:
+                                raise
                             except Exception as e:
                                 self.logger.warning(
                                     f"[SingleCubeView] Failed to archive merged_from memory {old_id}: {e}"

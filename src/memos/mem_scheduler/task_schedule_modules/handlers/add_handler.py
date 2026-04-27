@@ -14,6 +14,7 @@ from memos.mem_scheduler.schemas.task_schemas import (
 from memos.mem_scheduler.task_schedule_modules.base_handler import BaseSchedulerHandler
 from memos.mem_scheduler.utils.filter_utils import transform_name_to_key
 from memos.mem_scheduler.utils.misc_utils import is_cloud_env
+from memos.storage.exceptions import DependencyUnavailable
 
 
 if TYPE_CHECKING:
@@ -95,6 +96,8 @@ class AddMessageHandler(BaseSchedulerHandler):
                             memory_id=original_item_id, user_name=msg.mem_cube_id
                         )
                         original_content = original_mem_item.memory if original_mem_item else None
+                    except DependencyUnavailable:
+                        raise
                     except Exception as e:
                         logger.warning(
                             "Failed to fetch original memory %s for update log: %s",
@@ -113,6 +116,11 @@ class AddMessageHandler(BaseSchedulerHandler):
                 else:
                     prepared_add_items.append(mem_item)
 
+            except DependencyUnavailable:
+                # Storage outage during add-log preparation: re-raise so the
+                # dispatcher enqueues this batch into the durable retry queue
+                # instead of recording it as "missing" and silently dropping.
+                raise
             except Exception:
                 missing_ids.append(memory_id)
                 logger.debug(
