@@ -79,6 +79,21 @@ CREATE TABLE IF NOT EXISTS dead_letter (
 """
 
 
+class RetryAbort(Exception):
+    """Raise from a queue handler to skip retry and dead-letter immediately.
+
+    The queue's default policy is "exception → reschedule with backoff". That
+    is correct for transient dependency outages but wrong for two cases that
+    only the handler can detect:
+      - the underlying resource is gone for good (e.g. mem_cube was deleted
+        while the row was in the queue), so retrying just burns attempts
+      - the failure is a programming-class error surfaced during retry,
+        which would dead-letter eventually but should fail loudly now
+
+    The string passed in is recorded as the dead-letter `last_error`.
+    """
+
+
 def _now() -> float:
     return time.time()
 
@@ -347,6 +362,14 @@ class RetryQueue:
         attempt_num = row.attempt + 1
         try:
             handler(row.label, row.payload)
+        except RetryAbort as ra:
+            err = f"RetryAbort: {ra}"
+            self._move_to_dead_letter(row, err)
+            logger.warning(
+                f"[RetryQueue] dead-letter (abort) id={row.id} label={row.label} "
+                f"attempts={attempt_num} last_error={err}"
+            )
+            return
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             logger.info(

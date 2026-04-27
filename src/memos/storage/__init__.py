@@ -20,7 +20,7 @@ from memos.storage.exceptions import (
     Neo4jUnavailable,
     QdrantUnavailable,
 )
-from memos.storage.retry_queue import DEFAULT_QUEUE_PATH, RetryQueue
+from memos.storage.retry_queue import DEFAULT_QUEUE_PATH, RetryAbort, RetryQueue
 
 
 __all__ = [
@@ -31,5 +31,6 @@ __all__ = [
     "LLMUnavailable",
     "Neo4jUnavailable",
     "QdrantUnavailable",
+    "RetryAbort",
     "RetryQueue",
 ]
